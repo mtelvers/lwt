@@ -577,9 +577,13 @@ type open_flag =
 
 external open_job : string -> Unix.open_flag list -> int -> (Unix.file_descr * bool) job = "lwt_unix_open_job"
 
+(* Windows-specific open that uses CreateFileW with FILE_SHARE_DELETE,
+   avoiding "Permission denied" errors when files are open elsewhere. *)
+external win32_openfile : string -> Unix.open_flag list -> int -> Unix.file_descr = "lwt_unix_win32_open"
+
 let openfile name flags perms =
   if Sys.win32 then
-    Lwt.return (of_unix_file_descr (Unix.openfile name flags perms))
+    Lwt.return (of_unix_file_descr (win32_openfile name flags perms))
   else
     run_job (open_job name flags perms) >>= fun (fd, blocking) ->
     Lwt.return (of_unix_file_descr ~blocking fd)
