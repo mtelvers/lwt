@@ -1712,31 +1712,36 @@ let accept_n ?cloexec ch n =
     (fun exn -> Lwt.return (List.rev !l, Some exn))
 
 let connect ch addr =
-  if Sys.win32 then
-    (* [in_progress] tell whether connection has started but not
-       terminated: *)
-    let in_progress = ref false in
-    wrap_syscall Write ch begin fun () ->
-      if !in_progress then
-        (* Nothing works without this test and i have no idea why... *)
-        if writable ch then
-          try
-            Unix.connect ch.fd addr
-          with
-          | Unix.Unix_error (Unix.EISCONN, _, _) ->
-            (* This is the windows way of telling that the connection
-               has completed. *)
-            ()
-        else
-          raise Retry
-      else
-        try
-          Unix.connect ch.fd addr
-        with
-        | Unix.Unix_error (Unix.EWOULDBLOCK, _, _) ->
-          in_progress := true;
-          raise Retry
-    end
+  if Sys.win32 then begin
+    (* Windows signals a *failed* asynchronous connect through the exception
+       fd set, not the write set. [wrap_syscall Write] only ever waits for
+       writability, so a refused or unroutable connect is never signalled at
+       all: the promise stays pending for ever and the caller hangs with no
+       error and no exception. Connecting to a closed port on localhost, which
+       raises ECONNREFUSED immediately on Unix, never returns.
+
+       Drive the completion here instead, watching the write and exception
+       sets together and reporting the outcome via [getsockopt_error]. select
+       is reliable for sockets on Windows; it is pipe handles it cannot
+       handle. *)
+    check_descriptor ch;
+    let outcome () =
+      match Unix.getsockopt_error ch.fd with
+      | None -> Lwt.return_unit
+      | Some err -> Lwt.fail (Unix.Unix_error (err, "connect", ""))
+    in
+    let rec wait () =
+      check_descriptor ch;
+      match Unix.select [] [ch.fd] [ch.fd] 0.0 with
+      | (_, [], []) -> sleep 0.01 >>= wait
+      | (_, _, _) -> outcome ()
+    in
+    match Unix.connect ch.fd addr with
+    | () -> Lwt.return_unit
+    | exception Unix.Unix_error
+        ((Unix.EWOULDBLOCK | Unix.EINPROGRESS | Unix.EAGAIN), _, _) -> wait ()
+    | exception Unix.Unix_error (Unix.EISCONN, _, _) -> Lwt.return_unit
+  end
   else
     (* [in_progress] tell whether connection has started but not
        terminated: *)
